@@ -9,11 +9,11 @@ BioReagentMS 的 agent 侧全部家当（旧 py 版 `agent-BioReagentMS` 已于 
 langgraph.json          # graph 注册：reagent_assistant → src/agent/index.ts:graph
 contracts/              # ★ 跨语言契约单一事实源（doc-profile schema + Block 数组）
 src/
-├── agent/              # 主图：router→{db|knowledge|reaction|chat}→(dbQuery/rag/compatQuery/gap)→result 四路路由
+├── agent/              # 主图：router→{db|knowledge|chat}→(dbQuery/rag/gap)→result 三路路由
 │   ├── graph.ts        #   StateGraph 装配 + 判空降级全在代码（分流铁律）
 │   ├── prompts.ts      #   提示词归档（图内自带现行版本，此文件是历史参考）
 │   └── index.ts        #   langgraph.json 的取图入口（可选调试路）
-├── tools/              # query_reagent_db(模板白名单)/search_knowledge/reactionCompat(禁配)/gapAnswer(缺口) + dbTemplates
+├── tools/              # query_reagent_db(模板白名单)/search_knowledge/gapAnswer(缺口) + dbTemplates
 ├── rag/
 │   ├── inspect/        # ★ 三层探测 → DocProfile（魔数表 + zip 深判 + 内容嗅探兜底；失败事实进 notes）
 │   ├── parse/          # formats.ts 扩展名唯一事实源 + route(switch) + fromPy(pytools+diag+解释器候选)
@@ -30,7 +30,6 @@ src/
 │   ├── routes/gapKnowledge.ts # /gap 缺口知识（AI 生成 → 人工确认）
 │   ├── routes/stream.ts    #   /agent/runs/stream —— SSE 最小子集（前端不再依赖 :2024）
 │   ├── routes/review.ts    #   /review 解析层人审（B 线：列表/详情/确认入库/驳回）
-│   └── routes/reactionReview.ts # /reaction 禁配规则人审（A 线：候选裁决/发布/来源复核/规则查询）
 ├── db/                 # mysql2 只读池 + SELECT 断言
 └── config/             # zod 环境校验，缺 key 启动即死
 pytools/                # py 能力扩展：parse.py CLI（stdout=契约 JSON，失败=非零码，TS 侧旁路降级）
@@ -57,7 +56,7 @@ rag 空手 → gap 节点：先查 rag_gap_knowledge 能否复用（同问题不
 
 **prompt 层封死**：不许给任何具体数字结论（闪点/浓度/剂量/限值/库存）、不许给"能不能混放"的结论，
 第一句必须是"本地文档库中没有查到对应依据，以下是通用参考（未经核实）"——模型漏写时**代码兜底补上**。
-禁配路（reaction）与台账路（db）空手时**不生成**：混放结论只能来自已审核规则库，数字编一个比答不出危险得多。
+台账路（db）空手时**不生成**：数字编一个比答不出危险得多。
 
 DDL：`deploy/sql/05_rag_gap_knowledge.sql`（`question_hash` UNIQUE —— 没有它，同一问题会反复生成、表很快变垃圾场）。
 端点：`/gap/list`（分页）、`/gap/:id`、`/gap/:id/done`、`/gap/:id/ignore`；权限码 `gapKnowledge:query` / `:audit`。
@@ -67,14 +66,13 @@ DDL：`deploy/sql/05_rag_gap_knowledge.sql`（`question_hash` UNIQUE —— 没�
 | 线 | 干什么 | 端点 | 权限码 | 前端 |
 |----|--------|------|--------|------|
 | **B 解析层** | 过闸门不过/前门判死/拒收的文档：看档案+解析原文 → 改 → 确认入库 / 驳回 | `/review/pending`、`/review/:docId`、`/:docId/confirm`、`/:docId/reject` | `ragReview:query` / `:audit` | `ReviewParse.vue` |
-| **A 禁配规则** | LLM 抽出的候选 → 通过/拒绝 → 发布正式规则 → 来源失效后人工复核 | `/reaction/candidates*`、`/reaction/rules`、`/rules/publish`、`/rules/:id/reconfirm` | `reactionReview:query` / `:audit` | `ReviewReaction.vue` |
 
 三条纪律（都写进代码与测试）：
 1. **审核人只从 JWT 取**（`reviewerIdOf`）：body 里传的 `reviewedBy` 一律忽略 —— 审核记录必须能追到真人。
 2. **确认入库 ≠ 改个标记**：人工修正后的 blocks 会**重新切块 + 真入库**，否则队列写着"已确认"、库里却没内容（比空壳更坏的假绿）。
 3. **保密失败姿态**：`JWT_SECRET_KEY` 未配置 → 人审端点一律 503（**关掉，绝不敞开**）；权限查询失败 → 按不放行处理。
 
-DDL：`deploy/sql/04_rag_review_queue.sql`（队列表 + `ragReview:*` 权限点；`reactionReview:*` 在 02 里）。
+DDL：`deploy/sql/04_rag_review_queue.sql`（队列表 + `ragReview:*` 权限点）。
 落料点在 pipeline 四个非 done 出口（front-door / parser-reject / gate / needs-upgrade）——
 **闸门不过那处最值钱**：它存下完整 blocks，人审才有得改。
 
@@ -144,7 +142,7 @@ L2 人审队列(service /review) → 人工确认才入库，修正样本=回归
 改前基线：10.7 块/份、p50=109、碎片率 59.5%。两模式的**零丢失校验都是 0 失败**（与"清洗后原文"逐字相等）。
 
 **payload 契约 v3**：+ `overlap_chars`、+ `sections[]`（keyword index）；`SCHEMA_VERSION` 2→3。
-**代价**：切法变 → `seq` 全变 → reaction 已发布规则的 `source_chunk_seq` 漂移（lifecycle 会标 `source_stale`），
+**代价**：切法变 → `seq` 全变（解析层人审按 seq 定位来源），
 所以上线这套要配一次全量重摄 + 一轮规则来源复核。
 
 ## 快速开始
@@ -162,7 +160,7 @@ bun run dev            # 可选：langgraph server :2024 调试图结构用，�
 ## 集成期 TODO（9/6 结账）
 
 - [x] graph 名保持 `reagent_assistant`；`/runs/stream` 协议两端自写（stream.ts + Chat.vue），:2024 从关键路径摘除
-- [x] vite proxy：`/ingest` `/agent` `/review` `/reaction` `/gap` → 8123 全收编
+- [x] vite proxy：`/ingest` `/agent` `/review` `/gap` → 8123 全收编
 - [x] `git rm -r ../agent-BioReagentMS`（9/6 完成；.env 键已核对，新工程无缺失）
 - [ ] L2 人审队列实装（review.ts 空壳 + 前端对照页）
 - [ ] qa50 灌题跑命中率（地板值 0.35 等参数等它回调）

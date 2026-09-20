@@ -47,46 +47,54 @@ const PAYLOAD_INDEXES: readonly (readonly [string, 'keyword' | 'integer'])[] = [
 	['heading_path', 'keyword'], ['table_id', 'keyword'], // heading_path/sections 是数组，keyword index 会逐元素索引
 ]
 
-let collectionReady = false
+// 进程内"建集合"的单飞（single-flight）：check-then-act 之间隔着 await，
+// 只用布尔标志的话，两个并发首摄会同时看到 false、同时 collectionExists、同时 createCollection，
+// 第二个必然收到 400 → 异常上抛，那份文档被记成 failed（logIngest / enqueueReview 都做了旁路化，唯独这里没有）。
+// 缓存 **promise 本身**：并发调用共享同一次创建；失败则清空，允许下次重试（不把失败永久缓存住）。
+let collectionReady: Promise<void> | null = null
 async function ensureCollection(): Promise<void> {
-	if (collectionReady) return
-	// ⚠️ 1.19 客户端 collectionExists 返回 {exists:boolean} 对象而非裸布尔——直接 if(await) 恒真，血泪注释
-	if ((await qdrant.collectionExists(COLL)).exists) { collectionReady = true; return }
-	await qdrant.createCollection(COLL, {
-		vectors: { dense: { size: config.EMBED_DIM, distance: 'Dot' } },
-		sparse_vectors: { sparse: { modifier: 'idf' } }, // IDF 服务端统计，写入只管交 tf
+	collectionReady ??= (async () => {
+		// ⚠️ 1.19 客户端 collectionExists 返回 {exists:boolean} 对象而非裸布尔——直接 if(await) 恒真，血泪注释
+		if ((await qdrant.collectionExists(COLL)).exists) return
+		await qdrant.createCollection(COLL, {
+			vectors: { dense: { size: config.EMBED_DIM, distance: 'Dot' } },
+			sparse_vectors: { sparse: { modifier: 'idf' } }, // IDF 服务端统计，写入只管交 tf
+		})
+	})().catch((e) => {
+		collectionReady = null
+		throw e
 	})
-	collectionReady = true
+	await collectionReady
 }
 
-let indexesReady = false
 /**
  * payload index 的幂等兜底（已在线上跑的集合不会因为"建集合时加过"而自动补索引）：
  * createPayloadIndex 对已存在的索引是 no-op，真报错也只 warn —— 索引缺失只影响过滤性能，
- * 绝不能挡住写入主流程。进程内只跑一次。
+ * 绝不能挡住写入主流程。进程内只跑一次（同样用 promise 单飞，避免并发各跑一遍）。
  */
+let indexesReady: Promise<void> | null = null
 async function ensurePayloadIndex(): Promise<void> {
-	if (indexesReady) return
-	for (const [field_name, field_schema] of PAYLOAD_INDEXES) {
-		try {
-			await qdrant.createPayloadIndex(COLL, { field_name, field_schema, wait: true })
-		} catch (e) {
-			console.warn(`[store] payload index 跳过 ${field_name}:`, (e as Error).message.slice(0, 120))
+	indexesReady ??= (async () => {
+		for (const [field_name, field_schema] of PAYLOAD_INDEXES) {
+			try {
+				await qdrant.createPayloadIndex(COLL, { field_name, field_schema, wait: true })
+			} catch (e) {
+				console.warn(`[store] payload index 跳过 ${field_name}:`, (e as Error).message.slice(0, 120))
+			}
 		}
-	}
-	indexesReady = true
+	})().catch((e) => {
+		indexesReady = null
+		throw e
+	})
+	await indexesReady
 }
 
-/** 把一个文档的全部 chunk 写入向量库（先删同 doc_id 旧版本 = 增量重建不全库） */
+/** 把一个文档的全部 chunk 写入向量库（**先写新点、收尾再清理未覆盖的旧点** = 增量重建，不全库重建） */
 export async function upsertChunks(profile: DocProfile, chunks: Chunk[]): Promise<void> {
 	if (!chunks.length) return
 	await ensureCollection()
 	await ensurePayloadIndex()
 	const docId = chunks[0]!.docId
-	// 前置删除走 payload.doc_id filter（不按 point id）——所以 point id 从 32 位数字换成 UUID 后，
-	// 库里残留的"旧数字 id 点"照样被这一刀按 doc_id 清干净，重摄幂等不受影响。
-	// ⚠️ 全库只有这一处 + deleteDoc 两处删除；谁都不许改成按 id 删（id 会随方案演进，doc_id 才是身份）
-	await qdrant.delete(COLL, { filter: { must: [{ key: 'doc_id', match: { value: docId } }] }, wait: true })
 
 	const sourceDoc = profile.file.replace(/^.*[\\/]/, '')
 	for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
@@ -120,6 +128,21 @@ export async function upsertChunks(profile: DocProfile, chunks: Chunk[]): Promis
 		}))
 		await qdrant.upsert(COLL, { wait: true, points })
 	}
+
+	// 收尾：清掉"同 doc_id、但 seq 不在本次集合里"的旧点（重摄后块数变少时才会存在）。
+	// ⚠️ 这里是"先写后删"，不是"先删后写"：point id 由 pointId(docId, seq) 确定性生成，
+	//    同 seq 的新点会**原位覆盖**旧点，所以先写不会写重；而且中途失败时旧数据依然完整（最坏是部分更新）。
+	//    旧写法"先删后写"只要在 embed / 第 N 批 upsert 处抛错，就是"旧点已删、新点只写了一半"——
+	//    这份文档在检索里直接消失，而台账只留一条 failed（不可逆的静默数据丢失）。
+	// 判据仍走 payload.doc_id（不按 point id）：id 方案演进过（32 位数字 → UUID），doc_id 才是身份。
+	// ⚠️ 全库只有这一处 + deleteDoc 两处删除；谁都不许改成按 id 删。
+	await qdrant.delete(COLL, {
+		filter: {
+			must: [{ key: 'doc_id', match: { value: docId } }],
+			must_not: [{ key: 'seq', match: { any: chunks.map(c => c.seq) } }],
+		},
+		wait: true,
+	})
 }
 
 /** 整档删除：向量库按 doc_id 清空（与 upsert 同款 filter 写法），知识库页 / 重摄前用 */

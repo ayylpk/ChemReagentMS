@@ -7,7 +7,6 @@
     "dev": "langgraph dev",
     "service": "bun run src/service/server.ts",
     "ingest": "bun run scripts/ingest.ts",
-    "extract": "bun run scripts/extractReactions.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },

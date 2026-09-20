@@ -4,6 +4,8 @@ import { z } from 'zod'
 const req = (name: string) => z.string().min(1, 'missing ' + name)
 const url = (d: string) => z.string().url().default(d)
 const num = (d: number) => z.coerce.number().int().default(d)
+/** 环境变量布尔：只认 '1' / 'true'（**别用 z.coerce.boolean()**，它会把字符串 "false" 判成 true） */
+const bool = (d: boolean) => z.string().default(d ? '1' : '0').transform(v => v === '1' || v.toLowerCase() === 'true')
 
 export const config = z
   .object({
@@ -29,5 +31,10 @@ export const config = z
     JWT_SECRET_KEY: z.string().default(''),
     VL_MODEL: z.string().default('qwen-vl-ocr-latest'),
     SERVICE_PORT: num(8123),
+    /**
+     * 限流取客户端标识时，是否信任 X-Forwarded-For（默认 false → 用 TCP 对端地址，客户端伪造不了）。
+     * 只有**明确部署在可信反向代理后面**时才设 1；否则随便加一个 `X-Forwarded-For: 1.2.3.4` 头就换到新限流桶。
+     */
+    TRUST_PROXY: bool(false),
   })
   .parse(process.env)

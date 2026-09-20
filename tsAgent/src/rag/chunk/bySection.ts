@@ -213,10 +213,12 @@ export function bySection(file: string, blocks: Block[], options: BySectionOptio
 		const droppedNote = dropped ? [`[dedup] 相邻重复行去重 ${dropped} 行/段（同内容两形态，只留信息量大的一条）`] : []
 		let cursor = 0
 		for (const p of pieces) {
-			// 定位本片在 joined 里的位置：片按序连续，游标 + indexOf 足够（单文档文本量在 KB 级）
+			// 定位本片在 joined 里的位置：片是按序连续切出的，**本片新内容的起点就是上一片的终点**，推进游标即可。
+			// ⚠️ 曾经用 `joined.indexOf(body, cursor)` 反查：合并片（recursive 的 mergeToMin）用 '\n' 拼、
+			//    而 joined 用 '\n\n' 拼，被合并过的片文本根本不是 joined 的子串 → indexOf 恒为 -1 →
+			//    定位退化成"拿上一片终点顶着"的猜测，偏移随合并次数累积，section / headingPath 会归属到相邻分节。
 			const body = p.overlapChars ? p.text.slice(p.overlapChars) : p.text
-			let idx = joined.indexOf(body, cursor)
-			if (idx < 0) idx = cursor
+			const idx = cursor
 			const end = idx + body.length
 			cursor = end
 			const covered = kept.filter((k, i) => starts[i]! < end && starts[i]! + k.text.length > idx)

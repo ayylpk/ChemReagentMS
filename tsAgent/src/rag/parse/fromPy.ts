@@ -235,18 +235,33 @@ async function spawnParse(bin: string, file: string, mediaDir: string): Promise<
 		stdout: 'pipe',
 		stderr: 'pipe',
 	})
-	// 超时兜底：kill 后 exited 自然落地
-	const timer = setTimeout(() => { try { proc.kill() } catch { /* 已退出 */ } }, TIMEOUT_MS)
-	let stdout: string
-	let stderr: string
+	// 超时兜底分两级：先 SIGTERM，宽限 5s 仍不退则 SIGKILL。
+	// 只发一次 SIGTERM 是不够的 —— python 侧若派生了孙进程、或进程处于不可中断状态，信号会被忽略，
+	// 而 `await proc.exited` 与管道读取会**永不落地**：ingestDir 是顺序循环，后面所有文件跟着一起挂死，
+	// 且不产生任何台账（连"卡在哪一份"都查不到）。
+	const HARD_KILL_GRACE_MS = 5_000
+	let hardKill: ReturnType<typeof setTimeout> | undefined
+	const timer = setTimeout(() => {
+		try { proc.kill() } catch { /* 已退出 */ }
+		hardKill = setTimeout(() => { try { proc.kill(9) } catch { /* 已退出 */ } }, HARD_KILL_GRACE_MS)
+	}, TIMEOUT_MS)
+	let stdout = ''
+	let stderr = ''
 	try {
-		;[stdout, stderr] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-		])
-		await proc.exited
+		const done = (async () => {
+			;[stdout, stderr] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+			])
+			await proc.exited
+		})()
+		// 最后一道闸：即便 SIGKILL 之后管道仍未关闭（孙进程持有写端），也必须返回。
+		// 赢家是 guard 时 stdout/stderr 为空 → 契约解析失败 → 走 fallback/隔离，比整条 ingest 停死好得多。
+		const guard = new Promise<void>((resolve) => setTimeout(resolve, TIMEOUT_MS + HARD_KILL_GRACE_MS + 10_000))
+		await Promise.race([done, guard])
 	} finally {
 		clearTimeout(timer)
+		if (hardKill) clearTimeout(hardKill)
 	}
 	return { stdout, stderr, exitCode: proc.exitCode, ms: Date.now() - t0 }
 }

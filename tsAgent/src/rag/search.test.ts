@@ -115,7 +115,10 @@ describe('buildPayloadFilter：白名单枚举式过滤', () => {
 		const r = buildPayloadFilter({ section: '着火怎么办' })
 		// 9/16：跨节打包的配套 —— section 维度发 should（section 或 sections 数组任一命中），
 		// 只认 section 会漏掉"把该节并进去"的块（过滤静默失效比过滤不准更贵）
-		expect(r.filter?.must).toEqual([{ key: 'section', match: { value: '消防措施' } }])
+		// section 只走 should，**must 里不许再出现 section**：
+		// 跨节块的 section 是公共祖先，进 must 会把"把该节并进去"的块整批筛掉（9/18 修正，
+		// 旧断言恰好把这个错误结构钉成了"正确"）。
+		expect(r.filter?.must ?? []).toEqual([])
 		expect(r.filter?.should).toEqual([
 			{ key: 'section', match: { value: '消防措施' } },
 			{ key: 'sections', match: { value: '消防措施' } },
@@ -141,7 +144,7 @@ describe('buildPayloadFilter：白名单枚举式过滤', () => {
 			{ key: 'source_doc', match: { value: '硫酸SDS.pdf' } },
 			{ key: 'doc_id', match: { value: 'sds/硫酸SDS' } },
 		])
-		for (const c of r.filter!.must) expect(['section', 'cas_number', 'source_doc', 'doc_id']).toContain(c.key)
+		for (const c of r.filter!.must ?? []) expect(['section', 'cas_number', 'source_doc', 'doc_id']).toContain(c.key)
 	})
 
 	test('section 无法归一化 → 不施加', () => {

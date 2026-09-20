@@ -62,10 +62,14 @@ export async function hybridSearch(query: string, opts: HybridOptions = {}): Pro
 
 	const [vector] = await embed([query])
 
-	// 三路并发；一路挂只丢一路（旁路化：宁可召回差一点，不要整问失败）
+	// 三路并发；一路挂只丢一路（旁路化：宁可召回差一点，不要整问失败）。
+	// ⚠️ 但"丢了哪一路"必须往下传：稠密路失败时所有候选的 denseScore 都是 null，
+	//    若照常施加地板规则，稀疏路正常命中的也会被一起拒掉 —— 语义查询恒返回空（见 fuseRRF.denseFailed）。
+	let denseFailed = false
 	const [denseRes, sparseRes, casRes] = await Promise.all([
 		qdrant.query(COLL, { query: vector, using: 'dense', limit, filter, with_payload: true })
-			.then(r => toRaw(r.points)).catch(e => { console.warn('[search] 稠密路失败:', (e as Error).message); return [] as RawPoint[] }),
+			.then(r => toRaw(r.points))
+			.catch(e => { denseFailed = true; console.warn('[search] 稠密路失败:', (e as Error).message); return [] as RawPoint[] }),
 		qdrant.query(COLL, { query: toSparse(query), using: 'sparse', limit, filter, with_payload: true })
 			.then(r => toRaw(r.points)).catch(e => { console.warn('[search] 稀疏路失败:', (e as Error).message); return [] as RawPoint[] }),
 		// CAS 精查：payload 过滤直接捞（不受向量名次与地板限制），作为独立候选路参与 RRF
@@ -77,6 +81,9 @@ export async function hybridSearch(query: string, opts: HybridOptions = {}): Pro
 				}).then(r => toRaw(r.points)).catch(e => { console.warn('[search] CAS 精查失败:', (e as Error).message); return [] as RawPoint[] })
 			: Promise.resolve([] as RawPoint[]),
 	])
+	if (denseFailed) {
+		console.warn('[search] 稠密路失败 → 本轮跳过稠密地板（继续用稀疏/CAS 候选；否则查询恒空且与"库里没有"无法区分）')
+	}
 
-	return fuseRRF({ dense: denseRes, sparse: sparseRes, casFilter: casRes, precise, minDense, top })
+	return fuseRRF({ dense: denseRes, sparse: sparseRes, casFilter: casRes, precise, minDense, top, denseFailed })
 }

@@ -36,6 +36,17 @@ VL_PAGE_CAP = int(os.environ.get("VL_PAGE_CAP", "60"))   # 单次解析 VL 页�
 MEDIA: Path = Path("./_parse_media")           # main() 里被 --media-dir 覆写
 IMG_MIN_BYTES = 5 * 1024                        # <5KB 视为装饰线/页眉小图，直接丢引用
 CAPTION_CAP = 20                                # 每文档最多描述几张图（成本闸）
+# ⚠️ 预算必须是"每文档"而不是"每次调用"：PDF 是**逐页**调 caption_md 的，
+#    若像原来那样每页都 `uniq[:CAPTION_CAP]`（预算每页重置），一份 300 页的 PDF 最多能发起 300×20 次 VL 调用 ——
+#    成本闸在最重的格式上等于不存在。用可变容器让预算跨页累计
+#    （parse.py 一次只处理一个文件，进程级 == 文档级）。
+_IMG_BUDGET: dict[str, int] = {"left": CAPTION_CAP}
+
+# 图转文标记：**必须在写入侧打标，事后无法追认**。
+# 正文里出现它 = 这段是视觉模型转录的，不是文档原文。没有标记的话，下游（切块/检索/回答）
+# 分不出"原文"和"模型看图的转述"，而扫描件/整页截图全靠这条路 —— 用户会把模型的话当文献原文引用。
+TAG_PAGE_TRANSCRIBED = "**【图片转写·非文档原文】**"
+TAG_CAPTION = "图片转写："
 PAGE_LIKE_BYTES = 100 * 1024                    # ≥100KB 的图按"整页"转录（描述 prompt 会把整页压成两行）
 MD_IMG_RE = re.compile(r"!\[([^\]\n]*)\]\(([^)\s]+)\)")
 DATA_URI_RE = re.compile(r"!\[([^\]\n]*)\]\(data:image/([a-zA-Z+]+);base64,([A-Za-z0-9+/=]+)\)")
@@ -69,26 +80,55 @@ def _finish_diag(blocks: list[dict], extractor: str) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════
 # 文本读取与嗅探：编码猜错=整篇乱码，所以这里必须把 BOM/GBK 都吃下
 # ══════════════════════════════════════════════════════════════════════════
-_TEXT_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "big5", "cp1252")
+_TEXT_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "big5")
+# 注：cp1252 已从常规候选里移除（单独作为最后兜底）。原因：它对**任意字节**都能解码出"看似干净"的
+# 拉丁字母，混在候选里参与评分会把中文文件抢走（分数反而比正确编码更低）。
+
+
+def _suspicion(text: str) -> float:
+    """错解编码的可疑度：替换符 / 不该出现的控制符 / 私用区字符 的占比。
+    用于在多个"都能解码"的编码之间挑最优，也用于把"疑似误判"记进台账（绝不静默）。"""
+    if not text:
+        return 0.0
+    bad = 0
+    for ch in text:
+        o = ord(ch)
+        if ch == "\ufffd" or (o < 0x20 and ch not in "\t\n\r\f\v") or 0xE000 <= o <= 0xF8FF or 0xFFF0 <= o <= 0xFFFF:
+            bad += 1
+    return bad / len(text)
 
 
 def read_text(path: Path) -> str:
-    """按 BOM → UTF-8 → GB18030 → Big5 → CP1252 依次尝试解码；全失败则 utf-8 + replace（保住正文别抛）"""
+    """BOM → 多编码试解 → **按可疑度挑最优**；都不干净时用最优的那个并明确记账。
+    为什么不"谁先不抛谁赢"：GB18030 的双字节空间几乎覆盖全部双字节序列，
+    Big5 的字节流通常能被它"无异常解码"成乱码 —— 于是 big5 分支永远走不到，整篇乱码还无人知道。
+    全失败时退回 utf-8 + replace（保留 ASCII 骨架，比拉丁乱码有用）。"""
     raw = path.read_bytes()
     # ⚠️ UTF-32 的 BOM 前两字节与 UTF-16 相同，必须先判它（顺序错了整篇会解成乱码）
     if raw[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
         return raw.decode("utf-32", errors="replace")
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
         return raw.decode("utf-16", errors="replace")
+
+    best: tuple[str, str, float] | None = None  # (text, enc, suspicion)
     for enc in _TEXT_ENCODINGS:
         try:
             text = raw.decode(enc)
         except (UnicodeDecodeError, LookupError):
             continue
-        if enc not in ("utf-8-sig", "utf-8"):
-            _note(f"文本按 {enc} 解码（非 UTF-8）")
-        return text
+        score = _suspicion(text)
+        if score <= 0.001:
+            if enc not in ("utf-8-sig", "utf-8"):
+                _note(f"文本按 {enc} 解码（非 UTF-8）")
+            return text
+        if best is None or score < best[2]:
+            best = (text, enc, score)
+    if best is not None:
+        _note(f"文本按 {best[1]} 解码，但可疑度偏高（{best[2]:.1%}）—— 可能是编码误判，建议人工核对原文")
+        _inc("text_encoding_suspect")
+        return best[0]
     _note("文本编码无法确认，按 utf-8 + replace 兜底（可能有替换符）")
+    _inc("text_encoding_fallback")
     return raw.decode("utf-8", errors="replace")
 
 
@@ -243,6 +283,7 @@ def _caption_one(path: Path) -> tuple[str, str]:
         _inc("captions_failed")
         return "caption", "图片(读取失败)"
     if len(raw) < IMG_MIN_BYTES:
+        _inc("images_dropped_small")  # 小图按装饰图丢弃是有意规则，但"丢了几张"必须能查到（不静默）
         return "none", ""
     digest = hashlib.md5(raw).hexdigest()
     if digest in _caption_cache:
@@ -275,7 +316,10 @@ def caption_md(md: str) -> str:
         try:
             blob = base64.b64decode(b64)
         except Exception:
-            return ""  # 坏 URI 直接丢
+            # 坏 base64 的引用只能丢，但**必须记账**：静默丢内容 = 这份文档少了一张图而无人知道
+            _inc("images_dropped_bad_uri")
+            _note("有内联图片 base64 解码失败，其引用已删除（这部分内容缺失）")
+            return ""
         fname = MEDIA / f"emb-{hashlib.md5(blob).hexdigest()[:10]}.{ext}"
         if not fname.exists():
             fname.write_bytes(blob)
@@ -292,11 +336,13 @@ def caption_md(md: str) -> str:
     if not uniq:
         return md
     _inc("images_total", len(uniq))
-    todo = uniq[:CAPTION_CAP]
+    budget = max(0, _IMG_BUDGET["left"])   # 跨页累计（见 _IMG_BUDGET 注释）
+    todo = uniq[:budget]
+    _IMG_BUDGET["left"] -= len(todo)
     if len(uniq) > len(todo):
         _inc("images_over_cap", len(uniq) - len(todo))
-        print(f"[parse.py] 图片 {len(uniq)} 张超上限，只描述前 {CAPTION_CAP} 张", file=sys.stderr)
-        _note(f"图片 {len(uniq)} 张超 {CAPTION_CAP} 张上限，{len(uniq) - len(todo)} 张仅有原始引用")
+        print(f"[parse.py] 图片 {len(uniq)} 张超本档剩余预算（{budget} 张），只描述前 {len(todo)} 张", file=sys.stderr)
+        _note(f"图片 {len(uniq)} 张超本档预算（每文档 {CAPTION_CAP} 张），{len(uniq) - len(todo)} 张仅有原始引用")
 
     # ③ 并发描述（ThreadPool：VL 调用是网络 IO，4 路足够吃满配额前不惹眼）
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -312,8 +358,11 @@ def caption_md(md: str) -> str:
             if kind == "none":
                 return ""
             if kind == "page":
-                return f"\n{text}\n"     # 整页转写：独立成块（md 语法由它自己带）
-            return f"![{text or alt}]({target})"
+                # 整页转写：独立成块。**必须带标记** —— 这段文字是视觉模型写的，不是文档原文；
+                # 不带标记下游就分不出"原文"与"模型转述"，扫描件/整页截图全靠这条路，
+                # 用户会把模型的话当成文献原文引用（溯源链条在这里断掉）。
+                return f"\n{TAG_PAGE_TRANSCRIBED}\n\n{text}\n"
+            return f"![{TAG_CAPTION}{text or alt}]({target})"
         return m.group(0)  # 超上限没描述的：原引用带着走
     return MD_IMG_RE.sub(_backfill, md)
 
@@ -407,6 +456,9 @@ def _restore_docx_media(path: Path, md: str) -> str:
                 saved.append(dest)
     except Exception as e:
         print(f"[parse.py] docx 媒体抠图失败: {e}", file=sys.stderr)
+        # 只打 stderr 不够：进台账的是 stdout 的 diag，stderr 只留在控制台日志里
+        _inc("docx_media_failed")
+        _note(f"docx 抠图失败（{str(e)[:60]}）：图片仍是 data:image 占位，这部分图未转文")
         return md
     it = iter(saved)
     def _rep(m: re.Match) -> str:
@@ -759,15 +811,24 @@ def parse_csv(path: Path) -> list[dict]:
         dialect = _csv.Sniffer().sniff(sample, delimiters=",;\t|")
     except Exception:
         dialect = _csv.excel_tab if path.suffix.lower() == ".tsv" else _csv.excel
-    rows = [r for r in _csv.reader(text.splitlines(), dialect) if any(c.strip() for c in r)]
+    # ⚠️ 与 xlsx 同病：先把所有行物化再切片 = 把保险丝装在内存之后。这里改成**读取时就停**。
+    # （text 本身仍需整读为字符串：编码探测要先拿到全部字节；但行列表不再无界增长。）
+    rows: list[list[str]] = []
+    over_cap = False
+    for r in _csv.reader(text.splitlines(), dialect):
+        if not any(c.strip() for c in r):
+            continue
+        if len(rows) >= SHEET_ROW_CAP:
+            over_cap = True
+            break
+        rows.append(r)
     if not rows:
         _note("csv 无有效行")
         return _finish_diag([], "csv-table")
     note = ""
-    if len(rows) > SHEET_ROW_CAP:
+    if over_cap:
         note = f"\n（超 {SHEET_ROW_CAP} 行已截断：这类大表请导入 MySQL 走 SQL 查询）"
-        _note(f"csv {len(rows)} 行超 {SHEET_ROW_CAP} 行上限，已截断")
-    rows = rows[:SHEET_ROW_CAP]
+        _note(f"csv 超 {SHEET_ROW_CAP} 行上限，已截断")
     width = max(len(r) for r in rows)
     rows = [r + [""] * (width - len(r)) for r in rows]
     md = "\n".join(["| " + " | ".join(c.replace("|", "\\|") for c in rows[0]) + " |",
@@ -796,8 +857,17 @@ def parse_excel(path: Path) -> tuple[list[dict], str | None]:
     rejected: list[str] = []
     truncated = 0
     for ws in wb.worksheets:
-        rows = [[_cell(c) for c in r] for r in ws.iter_rows(values_only=True)
-                if any(str(c).strip() not in ("", "None") for c in r)]
+        # ⚠️ 截断必须发生在**读取时**：旧写法先 `[[...] for r in ws.iter_rows(...)]` 把整表物化进内存，
+        #    之后才切片 —— 百万元素的大表在切片之前就把内存吃光了，"巨表保险丝"名存实亡。
+        rows: list[list[str]] = []
+        over_cap = False
+        for r in ws.iter_rows(values_only=True):
+            if not any(str(c).strip() not in ("", "None") for c in r):
+                continue
+            if len(rows) >= SHEET_ROW_CAP:
+                over_cap = True
+                break
+            rows.append([_cell(c) for c in r])
         if not rows:
             continue
         _inc("sheets_total")
@@ -806,11 +876,10 @@ def parse_excel(path: Path) -> tuple[list[dict], str | None]:
             _inc("sheets_rejected")
             continue
         note = ""
-        if len(rows) > SHEET_ROW_CAP:
+        if over_cap:
             note = f"\n（超 {SHEET_ROW_CAP} 行已截断：这类大表请导入 MySQL 走 SQL 查询）"
             truncated += 1
             _inc("sheets_truncated")
-            rows = rows[:SHEET_ROW_CAP]
         md_table = "\n".join([
             "| " + " | ".join(rows[0]) + " |",
             "|" + "---|" * len(rows[0]),
@@ -924,4 +993,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # 契约行（末行 JSON）必须以 UTF-8 写出：Windows 下 stdout 走管道时按 locale 编码（如 cp936），
+    # VL 描述里的 emoji/生僻字会让 print 抛 UnicodeEncodeError → stdout 一行都没有，
+    # TS 侧（src/rag/parse/fromPy.ts）判「无契约输出」→ 白试多个解释器后走 fallback/隔离。stderr 同办，免得日志乱码。
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8")
     sys.exit(main())

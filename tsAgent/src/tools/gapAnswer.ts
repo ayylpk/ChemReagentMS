@@ -9,8 +9,7 @@
 //
 // 安全边界（写在 prompt 里，也在调用侧兜住）：
 //   · 数字（库存/价格/效期）、安全结论（闪点/禁配/急救剂量）**一律不许编**；
-//   · 只允许给"概念性、教科书级"的解释，并强制第一句声明"本地文档库无依据"；
-//   · 禁配（reaction）路**永远不走这里** —— 混放结论只能来自人工审核过的规则库。
+//   · 只允许给"概念性、教科书级"的解释，并强制第一句声明"本地文档库无依据"。
 import { ChatOpenAI } from '@langchain/openai'
 import { config } from '../config/env'
 import { findReusable, insertGap, bumpAskCount, type GapRow } from '../rag/store/gap'
@@ -115,8 +114,11 @@ export async function answerGap(
 		}
 	}
 	if (!text) text = '本地文档库没有查到依据，通用参考生成结果为空。'
-	// 免责声明兜底：模型偶尔会漏掉第一句，代码补上（不许靠提示词自觉）
-	if (!text.startsWith('本地文档库')) text = `本地文档库中没有查到对应依据，以下是通用参考（未经核实）：\n${text}`
+	// 免责声明兜底：模型偶尔会漏，代码补上（不许靠提示词自觉）。
+	// 判据不能只看开头 5 个字（"本地文档库"开头后面照样能接确定性结论，甚至"可以混合"）——
+	// 改成"整段必须出现免责标记"，没有就整段前置标准声明。
+	const DISCLAIMER_MARK = /未经核实|未经核对|仅供参考|请核实|待人工确认/
+	if (!DISCLAIMER_MARK.test(text)) text = `本地文档库中没有查到对应依据，以下是通用参考（未经核实）：\n${text}`
 
 	let id: number | null = null
 	try {

@@ -17,7 +17,11 @@ import { ingestFile } from '../../rag/pipeline'
 import { deleteDoc } from '../../rag/store/upsert'
 import { ALLOWED_EXT, CONVERT_REQUIRED_EXT, JUNK_EXT, convertRequiredReason, extOf, isJunkExt, unsupportedReason } from '../../rag/parse/formats'
 import { probe } from '../../rag/inspect/probe'
-import { CORPUS, docIdOf } from '../../rag/inspect/identity'
+import { CORPUS, ROOT, docDirName, docIdOf } from '../../rag/inspect/identity'
+// 鉴权：本组端点原先**一个都没挂**（/review、/gap 两组都挂了，只漏了这组）——
+// 后果是匿名可上传污染语料（检索时成为提示注入载体），也可用无鉴权的 /list 枚举 doc_id 后
+// 调 /delete 三删（向量库 + 台账 + 盘上原文件）。口径与其他三组一致：读用 query，写用 audit。
+import { requirePermission } from '../auth'
 
 export { CORPUS } // webSearch 确认件也落这（routes/webSearch.ts 共用；口径归 identity.ts，勿再各写一份）
 mkdirSync(CORPUS, { recursive: true })
@@ -69,6 +73,8 @@ export const ingestRoutes = new Hono()
 
 // 上传：multipart（字段名不限，所有 File 条目都收）→ 落盘 corpus/ → 预写台账 → 入队
 ingestRoutes.post('/upload', async (c) => {
+	const auth = await requirePermission(c, 'ragReview:audit')
+	if (!auth.ok) return auth.response!
 	const form = await c.req.formData()
 	// Bun 的 FormData 值类型标注是 string|File 联合体但过滤谓词不认，整体过 unknown 再收窄
 	const files = [...(form.values() as unknown as Iterable<unknown>)].filter((v): v is File => v instanceof File)
@@ -144,6 +150,8 @@ ingestRoutes.get('/formats', (c) =>
 
 // 台账列表：分页 + 状态/关键字过滤（前端 3s 轮询的就是它，SQL 保持轻）
 ingestRoutes.get('/list', async (c) => {
+	const auth = await requirePermission(c, 'ragReview:query')
+	if (!auth.ok) return auth.response!
 	const page = Math.max(Number(c.req.query('page')) || 1, 1)
 	const pageSize = Math.min(Math.max(Number(c.req.query('pageSize')) || 10, 1), 100)
 	const status = c.req.query('status') || ''
@@ -167,6 +175,8 @@ ingestRoutes.get('/list', async (c) => {
 
 // 重摄：按台账里的原盘路径重跑 pipeline（文件被删则请用户重新上传）
 ingestRoutes.post('/:docId/reingest', async (c) => {
+	const auth = await requirePermission(c, 'ragReview:audit')
+	if (!auth.ok) return auth.response!
 	const docId = c.req.param('docId')
 	const [rows] = (await pool.query('SELECT file FROM ingest_log WHERE doc_id=?', [docId])) as [{ file: string }[], unknown]
 	const row = rows[0]
@@ -179,17 +189,35 @@ ingestRoutes.post('/:docId/reingest', async (c) => {
 	return c.json({ ok: true }, 202)
 })
 
-// 删除：三删——向量库按 doc_id、台账行、盘上文件（Qdrant 失败不挡台账/文件清理，返回里如实报）
+// 删除：四删——向量库按 doc_id、台账行、盘上原文件、解析副产物（图转文的媒体目录）
+// ⚠️ 顺序有意为之：**向量库删成功才继续**，失败即中止且不改动台账/文件。
+//    旧写法是三步各删各的、互不阻断（向量库失败只记进 problems），会留下最难受的一种状态：
+//    向量库里这份文档还在（检索能命中），但台账和原文件都没了 —— 列表里看不见它，
+//    用户再也点不到删除，等于留下不可见、不可再删的孤儿数据。
 ingestRoutes.delete('/:docId', async (c) => {
+	const auth = await requirePermission(c, 'ragReview:audit')
+	if (!auth.ok) return auth.response!
 	const docId = c.req.param('docId')
 	const [rows] = (await pool.query('SELECT file FROM ingest_log WHERE doc_id=?', [docId])) as [{ file: string }[], unknown]
-	const problems: string[] = []
+
+	// ① 向量库（先做，且必须成功）
 	try {
 		await deleteDoc(docId)
 	} catch (e) {
-		problems.push(`向量库删除失败: ${(e as Error).message.slice(0, 100)}`)
+		const msg = (e as Error).message.slice(0, 150)
+		console.warn(`[ingest] 向量库删除失败，中止本次删除 docId=${docId}:`, msg)
+		return c.json({ error: `向量库删除失败，已中止本次删除（台账与原文件未改动，可稍后重试）：${msg}` }, 502)
 	}
+
+	// ② 台账行
 	await pool.query('DELETE FROM ingest_log WHERE doc_id=?', [docId])
+
+	const problems: string[] = []
+	// ③ 盘上原文件（已不存在不算错，force: true）
 	if (rows[0]) await rm(rows[0].file, { force: true }).catch((e) => problems.push(`盘上文件删除失败: ${e.message}`))
+	// ④ 解析副产物：图转文落盘的 resources/<docId>/（含 media/ 子目录）。
+	//    此前不在删除范围内 —— 删文档、重摄都不会回收，磁盘只增不减（仓库里已积了若干残留目录）。
+	await rm(join(ROOT, 'resources', docDirName(docId)), { recursive: true, force: true })
+		.catch((e) => problems.push(`媒体目录清理失败: ${e.message}`))
 	return c.json({ ok: true, problems })
 })

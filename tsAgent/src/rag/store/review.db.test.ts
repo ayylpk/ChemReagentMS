@@ -1,6 +1,6 @@
 // 连库往返测试：证明"迁移 04 的 DDL ↔ review store 的列清单/映射口径"真的对得上
 //   （列名拼错、JSON/MEDIUMTEXT 回读形态不符、人审状态机写错这类问题，离线测不出来）
-// 纪律（与 reaction/store.db.test.ts 同款）：
+// 纪律：
 //   · 库不可用 / 迁移未应用 → **整组跳过**，绝不让离线环境变红；
 //   · 自建数据只落在 'selftest.review.' 前缀的 doc_id 下，测试前后各清一次。
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'

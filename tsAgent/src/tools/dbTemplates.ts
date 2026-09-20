@@ -64,9 +64,20 @@ export function renderCatalog(): string {
 		.join('\n')
 }
 
+/**
+ * 「查询未能执行」的统一前缀。
+ * 调用方（agent/graph.ts）据此把**故障**与**空结果**分开 —— 两者对用户是完全不同的结论：
+ *   "未检索到相关内容" = 库里没有；"查询未能执行" = 系统坏了、稍后重试可能就有。
+ * 把故障当空结果，等于把系统故障读成业务结论。
+ */
+export const DB_FAIL_PREFIX = '⚠️查询未能执行（系统故障，不是"没有数据"）：'
+
 /** 执行入口：校验→参数化执行→markdown 表。返回文本永远是人话（错误也当数据回，不抛异常打断图） */
 export async function runTemplate(sqlName: string, params: Record<string, string> = {}): Promise<string> {
-	const tpl = TEMPLATES[sqlName]
+	// 必须走自有属性判断：TEMPLATES 是普通对象，sql_name 传 'constructor'/'toString'/'__proto__' 时
+	// 会命中 Object 原型成员（truthy，绕过 !tpl 判断），随后 tpl.params 为 undefined → for...of 抛 TypeError，
+	// 而该异常会被上层吞成"查询未命中"（不可观测）。用 hasOwnProperty 挡掉。
+	const tpl = Object.prototype.hasOwnProperty.call(TEMPLATES, sqlName) ? TEMPLATES[sqlName] : undefined
 	if (!tpl) return `未知模板 "${sqlName}"。可用：${Object.keys(TEMPLATES).join(' / ')}`
 	for (const p of tpl.params) {
 		if (p.required && !params[p.name]?.trim()) return `模板 ${sqlName} 缺必填参数 ${p.name}（${p.desc}）`
@@ -75,7 +86,8 @@ export async function runTemplate(sqlName: string, params: Record<string, string
 	try {
 		rows = await queryReadOnly<Record<string, unknown>>(tpl.sql, tpl.bind(params))
 	} catch (e) {
-		return `查询执行失败：${(e as Error).message.slice(0, 150)}`
+		// 必须带 DB_FAIL_PREFIX：上层据此判定这是**故障**而不是"没查到"
+		return `${DB_FAIL_PREFIX}${(e as Error).message.slice(0, 150)}`
 	}
 	if (!rows.length) return `模板 ${sqlName} 查询结果为空（条件可能太窄，试试放宽）`
 	const cols = Object.keys(rows[0]!)

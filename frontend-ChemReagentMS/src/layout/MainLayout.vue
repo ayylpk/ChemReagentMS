@@ -24,10 +24,9 @@ const allMenuItems = [
   { path: '/users', title: '用户管理', icon: 'User', roles: [0] },
   { path: '/chat', title: '智能助手', icon: 'ChatDotRound', roles: [0, 1, 2, 3, 4] },
   { path: '/knowledge', title: '知识库', icon: 'Notebook', roles: [0] },
-  // 人审两条线：解析层（ragReview:query/audit）+ 禁配规则（reactionReview:query/audit）
+  // 人审一条线：解析层（ragReview:query/audit）
   // 角色口径与后端 SQL 一致：query=1/2/4，audit=1/4，管理员 0 全通；这里按"能进页面"（query 档）给
   { path: '/review-parse', title: '解析人审', icon: 'DocumentChecked', roles: [0, 1, 2, 4] },
-  { path: '/review-reaction', title: '禁配审核', icon: 'Connection', roles: [0, 1, 4] },
   // 缺口知识：AI 生成 + 人工确认（gapKnowledge:query=1/2/4，audit=1/4）
   { path: '/gap-knowledge', title: '缺口知识', icon: 'MagicStick', roles: [0, 1, 2, 4] },
 ];
@@ -71,7 +70,6 @@ function goHome() {
     <!-- 侧边栏 -->
     <el-aside :width="isCollapse ? '64px' : '220px'" class="aside">
       <div class="logo-area" @click="goHome">
-        <img src="/logo.png" alt="logo" class="logo-img" />
         <span v-show="!isCollapse" class="logo-text">ChemReagentMS</span>
       </div>
 
@@ -152,15 +150,7 @@ function goHome() {
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-.logo-img {
-  height: 36px;
-  width: auto;
-  max-width: 100%;
-  flex-shrink: 0;
-}
-
 .logo-text {
-  margin-left: 10px;
   font-size: 16px;
   font-weight: 600;
   color: #fff;

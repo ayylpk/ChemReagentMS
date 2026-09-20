@@ -33,7 +33,11 @@ export async function ingestFile(file: string, opts: IngestOptions = {}): Promis
 	const result: IngestResult = { file, status: 'failed', chunks: 0, flags: [] }
 	// ⚠️ 必须 await：ingest CLI 打印完就 process.exit(0)，fire-and-forget 的台账写库赶不上死亡
 	const finish = async () => {
-		await logIngest({ docId: docIdOf(file), file, status: result.status, chunks: result.chunks, flags: result.flags, costMs: Math.round(performance.now() - t0) })
+		// dry-run 不产生副作用：台账状态记 'dry-run'，**绝不能记 'done'**。
+		// 依据：reingest 用 `SELECT doc_id FROM ingest_log WHERE status='done'` 判"已摄，跳过"，
+		// extractReactions 的准入也看 status='done'。dry-run 若写 done，等于台账谎报"已入库"——
+		// 此后这些文件在默认流程里永远不会被真正摄取（台账有记录、向量库里一个点都没有）。
+		await logIngest({ docId: docIdOf(file), file, status: opts.dryRun ? 'dry-run' : result.status, chunks: result.chunks, flags: result.flags, costMs: Math.round(performance.now() - t0) })
 		return result
 	}
 	try {
@@ -117,7 +121,9 @@ export interface ScanResult {
 export async function scanIngestables(dir: string): Promise<ScanResult> {
 	const files: string[] = []
 	const skipped: ScanResult['skipped'] = []
-	for await (const f of new Bun.Glob('**/*').scan({ cwd: dir, absolute: true })) {
+	// dot:true 必开：Bun.Glob 默认不产出隐藏条目，会让下面"隐藏文件/临时件"两个记账分支变成不可达的死代码——
+	// 口径本来是"扫到了但按规则不摄入的，记账不静默"，默认扫描实际是"静默不扫"。
+	for await (const f of new Bun.Glob('**/*').scan({ cwd: dir, absolute: true, dot: true })) {
 		const base = f.replace(/^.*[\\/]/, '')
 		const ext = extOf(f)
 		if (base.startsWith('.')) skipped.push({ file: f, reason: '隐藏文件' })

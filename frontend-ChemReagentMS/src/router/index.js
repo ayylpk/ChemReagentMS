@@ -113,12 +113,6 @@ const router = createRouter({
           meta: { title: '解析人审', icon: 'DocumentChecked' },
         },
         {
-          path: 'review-reaction',
-          name: 'ReviewReaction',
-          component: () => import('@/views/ReviewReaction.vue'),
-          meta: { title: '禁配审核', icon: 'Connection' },
-        },
-        {
           // 缺口知识：本地库没查到的问题由 AI 生成参考 → 进 MySQL → 这里人工确认（联网检索已移除）
           path: 'gap-knowledge',
           name: 'GapKnowledge',

@@ -57,8 +57,12 @@ export function looksLikeText(head: Uint8Array): boolean {
 	// BOM 直接认（UTF-16/UTF-32 的字节里控制符一堆，逐字符统计会误判成二进制）
 	if (head.length >= 2 && ((head[0] === 0xff && head[1] === 0xfe) || (head[0] === 0xfe && head[1] === 0xff))) return true
 	// 替换符数：UTF-8 解不开的字节会变成 U+FFFD；控制符（除 \t\n\r\f\v）在真文本里几乎为零（NUL 必杀）
+	// NUL（0x00）在真文本里不存在：单个即判二进制，直接短路返回。
+	// 旧写法是 `for (const b of head) if (b === 0) bad += 2` 参与比例计算，而分母是 512 字节——
+	// 一个 NUL 只贡献 2/512，远低于阈值，于是注释里"单个就足以说明是二进制"与实现正好相反：
+	// 含 1~3 个 NUL 的损坏/二进制文件仍被判成文本族，一路走 py 直读。
+	if (head.includes(0)) return false
 	let bad = 0
-	for (const b of head) if (b === 0) bad += 2 // NUL 加权：单个就足以说明是二进制
 	const decoded = new TextDecoder('utf-8', { fatal: false }).decode(head)
 	for (const ch of decoded) {
 		const c = ch.codePointAt(0)!
@@ -94,6 +98,26 @@ function probeDocx(xml: string): DocxProbe {
 		drawingCount: tagCount(xml, 'w:drawing'),
 		paraChars: xml.replace(/<[^>]+>/g, '').length,
 	}
+}
+
+/**
+ * zip 解压过滤器：只保留"判家族 + 探测 docx 结构"需要看的条目。
+ * 为什么需要它：docx/xlsx 里体积最大的通常就是 word/media、xl/media 下的图片，
+ * 全量解压等于把同一份文档在内存里放两份（压缩字节 + 全部条目），几十 MB 的文件在 2C4G 机器上就是 OOM 风险；
+ * 而前门只需要**条目名**加 document.xml 的内容。
+ * 注意：压缩包本身仍要整读（zip 的中央目录在尾部，非流式解压必须先拿到完整字节），
+ * 这里省掉的是"解压后全部条目"的那份副本。
+ */
+function keepForProbe(f: { name: string }): boolean {
+	const n = f.name
+	return (
+		n === 'word/document.xml' || //                docx：判家族 + 结构探测都靠它
+		n === 'ppt/presentation.xml' || //              pptx：判家族
+		n === 'content.xml' || //                       odf：判家族（兼兜底）
+		n === 'mimetype' || //                          odf：法定第一项
+		n === 'META-INF/manifest.xml' || //             odf：判家族
+		(n.startsWith('xl/') && n.endsWith('.xml')) //  xlsx：判家族
+	)
 }
 
 /**
@@ -196,10 +220,25 @@ export async function probe(file: string): Promise<DocProfile> {
 	//    （既往顺序是先看后缀直接 return，这种文件会被当文本读成乱码且无人知晓）
 	try {
 		if (magic === 'zip') {
-			const entries = unzipSync(new Uint8Array(await bunFile.arrayBuffer())) as Record<string, unknown>
+			// 只解必要条目（见 keepForProbe）：word/media 下的图片不进内存
+			const entries = unzipSync(new Uint8Array(await bunFile.arrayBuffer()), { filter: keepForProbe }) as Record<string, unknown>
 			const fam = classifyZip(entries)
 			if (fam) base.family = fam
 			else notes.push('zip 结构不属 docx/xlsx/pptx/odf（疑似普通压缩包）')
+			// ★ docx 结构探测必须在这里接上：decide() 里 docx 的三个分支（浮动文本框 / 图文倒挂 / 排版假表格）
+			//   全部依赖 profile.docx，而此前**没有任何地方给它赋值** —— 条件恒为假，所有 docx 一路掉到
+			//   decide 的兜底分支（L2-review），等于一份都进不了库，且台账里看不出原因。
+			if (fam === 'docx') {
+				const docXml = entries['word/document.xml']
+				if (docXml instanceof Uint8Array) {
+					base.docx = probeDocx(new TextDecoder('utf-8').decode(docXml))
+				} else {
+					// 取不到 document.xml（结构异常）也要给一个空档案，否则又会掉回兜底；
+					// 空档案下 decide 会走 docx 的默认路（L0-py），交给 py 侧如实报错。
+					notes.push('zip 判为 docx 但取不到 word/document.xml（结构异常），按默认 docx 策略处理')
+					base.docx = probeDocx('')
+				}
+			}
 		} else if (magic === 'pdf') {
 			base.family = 'pdf'
 			base.pdf = await probePdf(file)

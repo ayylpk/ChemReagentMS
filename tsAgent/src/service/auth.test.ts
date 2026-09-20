@@ -2,6 +2,7 @@
 // 覆盖：签名往返 / 篡改 / 错 secret / 过期 / alg=none 降级 / token 头口径 / 守卫三分支 / 审核人 uid
 // 纪律：人审端点能改知识库内容，"少配 secret 就放行"是最危险的失败姿态 —— 这里把 503 钉死
 import { describe, expect, test } from 'bun:test'
+import { createHmac } from 'node:crypto'
 import { Hono } from 'hono'
 import { createGuard, reviewerIdOf, roleHasPermission, signJwt, tokenOf, verifyJwt } from './auth'
 
@@ -45,6 +46,37 @@ describe('verifyJwt / signJwt', () => {
 
 	test('secret 为空 → 一律拒（不给"没配 secret 就全通过"留缝）', () => {
 		expect(verifyJwt(signJwt({ uid: 1, role: 0 }, ''), '')).toBeNull()
+	})
+
+	// ★ 回归钉子：这个项目的 token 由 Java 后端签发，两边对 secret 的处理必须一致。
+	//   Java 是 Keys.hmacShaKeyFor(Base64.getDecoder().decode(secretKey))（JwtUtil.java:18/31），
+	//   即"先把 secret 当 base64 解码，再用解出的字节当 HMAC key"。
+	//   历史 bug：本侧直接拿 secret 原串当 key → Java 签的真 token 永远验不过（登录成功却 401），
+	//   而离线单测自己签自己验，全绿也发现不了。下面第一条就是钉住这个口径的。
+	test('★ 与 Java 同口径：secret 要先 base64 解码再当 HMAC key', () => {
+		const b64Secret = Buffer.from('0123456789abcdef0123456789abcdef').toString('base64')
+		const b64u = (b: Buffer) => b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+		const signWith = (key: Buffer) => {
+			const h = b64u(Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })))
+			const p = b64u(Buffer.from(JSON.stringify({ uid: 5, role: 0, exp: Math.floor(Date.now() / 1000) + 600 })))
+			return `${h}.${p}.${b64u(createHmac('sha256', key).update(`${h}.${p}`).digest())}`
+		}
+		// 正确口径（= Java）：base64 解码出的 32 字节当 key
+		expect(verifyJwt(signWith(Buffer.from(b64Secret, 'base64')), b64Secret)?.uid).toBe(5)
+		// 修复前的错口径：拿原串当 key → 必须验不过
+		expect(verifyJwt(signWith(Buffer.from(b64Secret, 'utf8')), b64Secret)).toBeNull()
+	})
+
+	test('★ 缺 exp / exp 非数字 → 拒（不许 fail-open 当成永不过期）', () => {
+		const b64u = (b: Buffer) => b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+		const raw = (payload: Record<string, unknown>) => {
+			const h = b64u(Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })))
+			const p = b64u(Buffer.from(JSON.stringify(payload)))
+			return `${h}.${p}.${b64u(createHmac('sha256', Buffer.from(SECRET, 'base64')).update(`${h}.${p}`).digest())}`
+		}
+		expect(verifyJwt(raw({ uid: 1, role: 0 }), SECRET)).toBeNull()
+		expect(verifyJwt(raw({ uid: 1, role: 0, exp: '9999999999' }), SECRET)).toBeNull()
+		expect(verifyJwt(raw({ uid: 1, role: 0, exp: Math.floor(Date.now() / 1000) + 600 }), SECRET)?.uid).toBe(1)
 	})
 })
 

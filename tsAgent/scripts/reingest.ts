@@ -15,7 +15,20 @@ if (!target) {
 	console.error('usage: bun run reingest -- <dir> [--limit N] [--redo] [--dry-run]')
 	process.exit(1)
 }
-const limit = (() => { const i = argv.indexOf('--limit'); return i >= 0 ? Number(argv[i + 1]) || 0 : 0 })()
+// --limit 只接受正整数。旧写法 `Number(x) || 0` 会把 abc / 缺值 / 负数一律静默变成 0，
+// 而 0 的语义是"不限量"→ 本意"先打样定速率"的安全阀，参数写错反而变成全量跑数小时。
+// 宁可当场报错退出，也不要悄悄换个语义执行。
+const limit = (() => {
+	const i = argv.indexOf('--limit')
+	if (i < 0) return 0
+	const raw = argv[i + 1]
+	const n = Number(raw)
+	if (!Number.isInteger(n) || n < 1) {
+		console.error(`--limit 需要正整数，收到 "${raw ?? ''}"（拒绝把非法值当成"不限量"）`)
+		process.exit(1)
+	}
+	return n
+})()
 
 // 台账 done 集合按 doc_id 比对（与 pipeline logIngest / bySection 新口径逐字同一函数）——
 // ⚠️ 这里原先按"去后缀文件名"比对：identity.ts 新口径下 corpus 子目录文档的 doc_id 变成

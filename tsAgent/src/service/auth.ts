@@ -26,11 +26,21 @@ export interface TokenPayload {
 const b64urlToBuf = (s: string): Buffer => Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64')
 const b64url = (b: Buffer): string => b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 
+/**
+ * HMAC 密钥派生：**必须与 Java 后端同口径**。
+ * Java 侧是 `Keys.hmacShaKeyFor(Base64.getDecoder().decode(secretKey))`
+ *   （见 backend-.../common/.../utils/JwtUtil.java:18 签发、:31 解析）
+ * 即：把配置里的 secret 先 base64 解码成 32 字节，再用作 HMAC 密钥。
+ * ⚠️ 曾经直接拿 secret 原串（44 字符）当 key —— 那样 Java 签出的合法 token 在本服务里签名恒不匹配，
+ *   表现是"登录成功却永远 401"，且离线单测因为自己签自己验而全绿，抓不到。
+ */
+const hmacKey = (secret: string): Buffer => Buffer.from(secret, 'base64')
+
 /** 签发（只在测试与本地调试用；生产 token 由 Java 后端签） */
 export function signJwt(payload: TokenPayload, secret: string, ttlSeconds = 3600): string {
 	const header = b64url(Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })))
 	const body = b64url(Buffer.from(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + ttlSeconds })))
-	const sig = b64url(createHmac('sha256', secret).update(`${header}.${body}`).digest())
+	const sig = b64url(createHmac('sha256', hmacKey(secret)).update(`${header}.${body}`).digest())
 	return `${header}.${body}.${sig}`
 }
 
@@ -50,7 +60,7 @@ export function verifyJwt(token: string, secret: string): TokenPayload | null {
 		return null
 	}
 	if (header.alg !== 'HS256') return null
-	const expect = createHmac('sha256', secret).update(`${h}.${p}`).digest()
+	const expect = createHmac('sha256', hmacKey(secret)).update(`${h}.${p}`).digest()
 	const got = b64urlToBuf(s)
 	if (got.length !== expect.length || !timingSafeEqual(got, expect)) return null
 	let payload: TokenPayload
@@ -59,7 +69,7 @@ export function verifyJwt(token: string, secret: string): TokenPayload | null {
 	} catch {
 		return null
 	}
-	if (typeof payload.exp === 'number' && payload.exp * 1000 < Date.now()) return null
+	if (typeof payload.exp !== 'number' || payload.exp * 1000 < Date.now()) return null
 	return payload
 }
 

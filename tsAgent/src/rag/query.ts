@@ -78,7 +78,8 @@ export interface PayloadFilterSpec {
 }
 
 export interface PayloadFilterResult {
-	filter?: { must: PayloadFilterClause[]; should?: PayloadFilterClause[] }
+	/** must 可缺省：只有 section 一个条件时结果是 { should: [...] }（section 进 must 会筛掉跨节块，见 buildPayloadFilter） */
+	filter?: { must?: PayloadFilterClause[]; should?: PayloadFilterClause[] }
 	applied: PayloadFilterClause[]
 	dropped: { field: FilterKey; value: string; reason: string }[]
 }
@@ -100,7 +101,9 @@ export function buildPayloadFilter(spec: PayloadFilterSpec): PayloadFilterResult
 				{ key: 'section', match: { value: std } },
 				{ key: 'sections', match: { value: std } }, // payload.sections 是 string[]，Qdrant 语义 = 任一元素命中
 			]
-			applied.push({ key: 'section', match: { value: std } })
+			// ⚠️ section 只能进 should，**绝不能同时进 must**：跨节打包块的 section 记的是覆盖帧的公共祖先
+			//    （不等于叶子名），一旦进了 must，这类块会被整批筛掉 —— 正是本函数要防的"过滤静默少数据"。
+			//    曾经两处都放，should 被 must 架空（and 语义），9/18 审查修。
 		} else dropped.push({ field: 'section', value: section, reason: '无法归一化到 SDS 标准分节名' })
 	}
 
@@ -118,7 +121,11 @@ export function buildPayloadFilter(spec: PayloadFilterSpec): PayloadFilterResult
 	if (docId) applied.push({ key: 'doc_id', match: { value: docId } })
 
 	return {
-		filter: applied.length ? { must: applied, ...(should ? { should } : {}) } : undefined,
+		// 判空必须带上 should：只有 section 一个条件时 applied 是空的，
+		// 若按 applied.length 判就会连 should 一起丢掉 → 过滤彻底失效（返回全库，静默）
+		filter: applied.length || should
+			? { ...(applied.length ? { must: applied } : {}), ...(should ? { should } : {}) }
+			: undefined,
 		applied, dropped,
 	}
 }
@@ -157,6 +164,12 @@ export interface FuseInput {
 	precise: boolean // 精确查询：不适用 dense 地板
 	minDense: number // 语义查询的稠密地板（常量由 search.ts 持有，这里只接收）
 	top: number
+	/**
+	 * 稠密路**整体失败**（网络/服务端出错，而不是"返回空"）时置 true。
+	 * 此时每个点的 denseScore 都是 null；若照常施加"未进 dense top → 视作 0 分 → 拒"的地板规则，
+	 * 稀疏路正常命中的候选会被一起拒掉 —— 语义查询恒返回空，上层把"检索故障"读成"库里没有"。
+	 */
+	denseFailed?: boolean
 }
 
 const ROUTE_ORDER: readonly MatchRoute[] = ['dense', 'sparse', 'cas_filter']
@@ -242,8 +255,10 @@ export function fuseRRF(input: FuseInput): HybridHit[] {
 
 	const out: HybridHit[] = []
 	for (const b of buckets.values()) {
-		// 地板闸：语义查询只认稠密路原始分（未进 dense top → null → 视作 0 → 被拒）
-		if (!input.precise && (b.denseScore ?? 0) < input.minDense) continue
+		// 地板闸：语义查询只认稠密路原始分（未进 dense top → null → 视作 0 → 被拒）。
+		// ⚠️ 稠密路整体失败时**不施加**这条：否则每个候选的 denseScore 都是 null、全被拒，
+		//    语义查询恒返回空 —— 上层会把"检索故障"当成"本库没有这条知识"（故障与空结果不可区分）。
+		if (!input.denseFailed && !input.precise && (b.denseScore ?? 0) < input.minDense) continue
 		out.push(toHit(b))
 	}
 	out.sort(
